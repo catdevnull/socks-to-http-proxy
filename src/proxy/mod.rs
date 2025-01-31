@@ -1,4 +1,6 @@
 use auth::Auth;
+use base64::engine::general_purpose;
+use base64::Engine;
 use color_eyre::eyre::Result;
 
 pub mod auth;
@@ -28,7 +30,7 @@ async fn proxy(
     socks_addr: SocketAddr,
     auth: Option<&'static Auth>,
     allowed_domains: Option<&'static Vec<String>>,
-    basic_http_header: Option<&HeaderValue>,
+    basic_http_header: Option<&'static HeaderValue>,
 ) -> Result<Response<BoxBody<Bytes, hyper::Error>>> {
     let mut authenticated = false;
     let hm = req.headers();
@@ -81,9 +83,19 @@ async fn proxy(
     if Method::CONNECT == req.method() {
         if let Some(addr) = host_addr(req.uri()) {
             tokio::task::spawn(async move {
+                let hm = req.headers().clone();
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
-                        if let Err(e) = tunnel(upgraded, addr, socks_addr, auth).await {
+                        if let Err(e) = tunnel(
+                            upgraded,
+                            addr,
+                            socks_addr,
+                            auth,
+                            basic_http_header.clone(),
+                            hm,
+                        )
+                        .await
+                        {
                             warn!("server io error: {}", e);
                         };
                     }
@@ -113,7 +125,27 @@ async fn proxy(
             )
             .await
             .unwrap(),
-            None => Socks5Stream::connect(socks_addr, addr).await?,
+            None => match (basic_http_header, hm.get("proxy-authorization")) {
+                (None, Some(http_auth)) => {
+                    // HACK: we pass through proxy auth header
+                    let decoded_auth = String::from_utf8(
+                        general_purpose::STANDARD.decode(
+                            http_auth
+                                .to_str()
+                                .unwrap()
+                                .trim_start_matches("Basic ")
+                                .trim(),
+                        )?,
+                    )?;
+                    let (username, password) = decoded_auth
+                        .split_once(':')
+                        .ok_or_else(|| color_eyre::eyre::eyre!("Invalid auth format"))?;
+                    Socks5Stream::connect_with_password(socks_addr, addr, username, password)
+                        .await
+                        .unwrap()
+                }
+                _ => Socks5Stream::connect(socks_addr, addr).await?,
+            },
         };
         let io = TokioIo::new(stream);
 
@@ -149,19 +181,65 @@ fn full<T: Into<Bytes>>(chunk: T) -> BoxBody<Bytes, hyper::Error> {
         .boxed()
 }
 
+async fn connect_with_auth(
+    socks_addr: SocketAddr,
+    addr: String,
+    auth: Option<Auth>,
+    basic_http_header: Option<&'static HeaderValue>,
+    hm: hyper::HeaderMap<hyper::header::HeaderValue>,
+) -> Result<Socks5Stream<TcpStream>> {
+    match auth {
+        Some(auth) => Ok(Socks5Stream::connect_with_password(
+            socks_addr,
+            addr,
+            &auth.username,
+            &auth.password,
+        )
+        .await
+        .unwrap()),
+        None => match (basic_http_header, hm.get("proxy-authorization")) {
+            (None, Some(http_auth)) => {
+                println!("no http header configured but passed auth, trying to log into socks proxy with auth");
+                let decoded_auth = String::from_utf8(
+                    general_purpose::STANDARD.decode(
+                        http_auth
+                            .to_str()
+                            .unwrap()
+                            .trim_start_matches("Basic ")
+                            .trim(),
+                    )?,
+                )?;
+                let (username, password) = decoded_auth
+                    .split_once(':')
+                    .ok_or_else(|| color_eyre::eyre::eyre!("Invalid auth format"))?;
+                println!("{} {} {}", username, password, addr);
+                Ok(
+                    Socks5Stream::connect_with_password(socks_addr, addr, username, password)
+                        .await
+                        .unwrap(),
+                )
+            }
+            _ => Ok(Socks5Stream::connect(socks_addr, addr).await?),
+        },
+    }
+}
+
 async fn tunnel(
     upgraded: Upgraded,
     addr: String,
     socks_addr: SocketAddr,
     auth: Option<&Auth>,
+    basic_http_header: Option<&'static HeaderValue>,
+    hm: hyper::HeaderMap<hyper::header::HeaderValue>,
 ) -> Result<()> {
-    let mut stream = match auth {
-        Some(auth) => {
-            Socks5Stream::connect_with_password(socks_addr, addr, &auth.username, &auth.password)
-                .await?
-        }
-        None => Socks5Stream::connect(socks_addr, addr).await?,
-    };
+    let mut stream = connect_with_auth(
+        socks_addr,
+        addr,
+        auth.map(|a| a.clone()),
+        basic_http_header,
+        hm,
+    )
+    .await?;
 
     let mut upgraded = TokioIo::new(upgraded);
 
